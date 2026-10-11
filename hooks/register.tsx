@@ -422,6 +422,8 @@ const show = async ($: EngineInterface, id: Tab) => {
   }
 }
 
+// The press that asks for it waits on this: an open made once the press has settled
+// is an unasked one, which a terminal under 144 columns leaves undrawn.
 const toggle = async ($: EngineInterface) => {
   try {
     const mine = (await $.ui.panes()).find(pane => pane.id === PANE)
@@ -610,13 +612,7 @@ export const register: Register = on => {
 
     return (
       <Box flexDirection="row">
-        <Button
-          key="toggle"
-          plain
-          onPress={() => {
-            void toggle($)
-          }}
-        >
+        <Button key="toggle" plain onPress={() => toggle($)}>
           ◧ Context
           <Text dimColor>{fill}</Text>
         </Button>

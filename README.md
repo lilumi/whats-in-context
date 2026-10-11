@@ -70,3 +70,4 @@ Things to know before changing it:
 - **Content is kept per entry** in a `$.state` family (`bodies`), keyed by the entry's id. An entry from before the mod loaded has none, and is read back from the transcript when its row is opened.
 - **Text is cleaned before it is drawn**: a tree with a control character in it is refused, so escape sequences and control characters are stripped.
 - **A row's title is cut to the pane's width** in code, not by the surface, because a `Button` takes no `wrap`.
+- **The button's `onPress` returns `toggle`'s promise**, so the press lasts until the pane is opened. Claude Code draws a pane the person asked for at any width (a sidebar from 110 columns, above the prompt under that), and one opened on the mod's own only from 144. An open made after the press has settled counts as the mod's own, and on a narrower terminal the click then shows nothing.

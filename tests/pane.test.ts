@@ -339,6 +339,28 @@ test('the button above the prompt opens the pane, then closes it', async ($, on)
   ])
 })
 
+test('the press on the button lasts until the pane is opened, so the open is an asked one', async ($, on) => {
+  const order: string[] = []
+  on('ui.panes', () => ({ value: [] }))
+  on('ui.open', () => {
+    order.push('opened')
+
+    return { value: { isPlaced: true } }
+  })
+  on('ui.press', async (_, e, next) => {
+    const pressed = await next(e)
+    order.push('settled')
+
+    return pressed
+  })
+
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  await ui.press({ key: 'toggle' })
+  await ui.unmount()
+
+  expect(order).toEqual(['opened', 'settled'])
+})
+
 test('a context reading draws the fill in the pane and on the button', async ($, on) => {
   mock.clock(on, { now: 1000 })
   on('session.measure', (_, e) => ({ changed: e.changed }))
