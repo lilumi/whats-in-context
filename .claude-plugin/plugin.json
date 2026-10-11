@@ -1,0 +1,9 @@
+{
+  "name": "whats-in-context",
+  "version": "0.2.0",
+  "description": "What's in context: a sidebar listing the prompts, files and tool results Claude read this session, each one opened by a click, and how the context window filled up over time.",
+  "author": {
+    "name": "Lilumi"
+  },
+  "types": "./types/index.d.ts"
+}

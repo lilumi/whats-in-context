@@ -1,0 +1,16 @@
+{
+  "name": "whats-in-context",
+  "owner": {
+    "name": "Lilumi"
+  },
+  "metadata": {
+    "description": "The What's in context mod, installed from its own working folder."
+  },
+  "plugins": [
+    {
+      "name": "whats-in-context",
+      "source": "./",
+      "description": "A sidebar listing the prompts, files and tool results Claude read this session, each one opened by a click, and how the context window filled up over time."
+    }
+  ]
+}
