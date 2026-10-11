@@ -26,6 +26,9 @@ export type Body = {
   note: string
 }
 
+/** One entry opened in place, and which part of its content is drawn, from 0. */
+export type Opened = { id: string; page: number }
+
 /** The context window's fill as one API response reported it. */
 export type Sample = { at: number; tokens: number; window: number }
 
@@ -54,10 +57,8 @@ declare module 'claude-code' {
       tab: Tab
       startedAt: number
       isSeeded: boolean
-      /** The id of the entry opened in place; '' while none is. */
-      selected: string
-      /** Which part of the opened entry's content is drawn, from 0. */
-      page: number
+      /** The entries opened in place, the one opened last at the end; empty while none is. */
+      opened: Opened[]
       /** The entry count the timeline's window ends at; -1 follows the newest. */
       listEnd: number
       /** Each entry's content, by the entry's id. */

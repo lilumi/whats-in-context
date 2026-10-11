@@ -11,6 +11,7 @@ A Claude Code mod (a plugin with a hooks module) that shows what Claude has read
   - **Prompts**: each prompt.
   - **Now**: the window by category, as `/context` breaks it down.
 - **Click a row** to open it in place: a tool call's input and result, a file's content with line numbers, a prompt's whole text, a compaction's summary. Long content is drawn a part at a time.
+- **Several rows stay open at once**, up to 8. Another click on a row, or its `▴ Close`, closes that one; `▴ Close all` under the tabs, or a change of tab, closes them all.
 
 ## Layout
 
@@ -64,7 +65,8 @@ npx -y -p typescript tsc -p .
 Things to know before changing it:
 
 - **Sizes are estimates** (characters / 4). Only the fill and the sparkline are real API figures.
-- **Nothing recorded is dropped.** One drawing can hold only so much text, so the timeline draws 200 rows at a time and an opened entry 8,000 characters at a time.
+- **Nothing recorded is dropped.** One drawing can hold only so much text (100,000 characters), so the timeline draws 200 rows at a time, an opened entry 8,000 characters at a time, and 8 entries stay open at once: opening a ninth closes the one opened first.
+- **The `j` and `k` keys turn the parts of one entry**: the one opened last among those long enough to have parts. The others are turned by their own `‹ Earlier` and `Later ›`.
 - **Content is kept per entry** in a `$.state` family (`bodies`), keyed by the entry's id. An entry from before the mod loaded has none, and is read back from the transcript when its row is opened.
 - **Text is cleaned before it is drawn**: a tree with a control character in it is refused, so escape sequences and control characters are stripped.
 - **A row's title is cut to the pane's width** in code, not by the surface, because a `Button` takes no `wrap`.

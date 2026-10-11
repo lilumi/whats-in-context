@@ -109,14 +109,87 @@ test('a long result is read a part at a time', async ($, on) => {
   const ui = await $.ui.mount({ ...pane(60), surface: 'terminal' })
   await ui.press({ key: 'entry-b1' })
   expect(String((await ui.find({ type: 'Code' }))?.props.source)).toContain('command: cat big.log')
-  expect(await ui.find({ key: 'top-earlier' })).toBeUndefined()
+  expect(await ui.find({ key: 'top-earlier-b1' })).toBeUndefined()
 
   let source = ''
-  for (let part = 0; part < 20 && (await ui.find({ key: 'top-later' })) !== undefined; part++) {
-    await ui.press({ key: 'top-later' })
+  for (let part = 0; part < 20 && (await ui.find({ key: 'top-later-b1' })) !== undefined; part++) {
+    await ui.press({ key: 'top-later-b1' })
     source = String((await ui.find({ type: 'Code' }))?.props.source)
   }
   expect(source).toContain('line 1200 of the output')
+  await ui.unmount()
+})
+
+test('several entries stay open at once, each closed by itself or all together', async ($, on) => {
+  mock.clock(on, { now: 1000 })
+  on('tool.call', (_, e) => ({ result: undefined as never, text: `output of ${e.tool_use_id}` }))
+
+  for (const id of ['a', 'b', 'c']) {
+    await $.tool.call({ tool: 'Bash', tool_use_id: id, command: `echo ${id}` })
+  }
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...pane(60), surface })
+    const sources = async () =>
+      (await ui.findAll({ type: 'Code' })).map(code => String(code.props.source).split('\n').at(-1))
+
+    await ui.press({ key: 'entry-a' })
+    expect(await ui.find({ key: 'close-all' })).toBeUndefined()
+    await ui.press({ key: 'entry-c' })
+    await ui.press({ key: 'entry-b' })
+    expect(await sources()).toEqual(['output of a', 'output of b', 'output of c'])
+
+    await ui.press({ key: 'close-b' })
+    expect(await sources()).toEqual(['output of a', 'output of c'])
+    await ui.press({ key: 'entry-a' })
+    expect(await sources()).toEqual(['output of c'])
+
+    await ui.press({ key: 'entry-a' })
+    await ui.press({ key: 'close-all' })
+    expect(await sources()).toEqual([])
+    await ui.unmount()
+  }
+})
+
+test('each open entry turns its own parts, and the keys go to the one opened last', async ($, on) => {
+  mock.clock(on, { now: 1000 })
+  on('tool.call', (_, e) => ({
+    result: undefined as never,
+    text: Array.from({ length: 1200 }, (_, index) => `${e.tool_use_id} line ${index + 1}`).join('\n'),
+  }))
+
+  await $.tool.call({ tool: 'Bash', tool_use_id: 'x', command: 'cat x.log' })
+  await $.tool.call({ tool: 'Bash', tool_use_id: 'y', command: 'cat y.log' })
+
+  const ui = await $.ui.mount({ ...pane(60), surface: 'terminal' })
+  await ui.press({ key: 'entry-x' })
+  expect((await ui.find({ key: 'top-later-x' }))?.props.hotkey).toBe('j')
+
+  await ui.press({ key: 'entry-y' })
+  expect((await ui.find({ key: 'top-later-x' }))?.props.hotkey).toBeUndefined()
+  expect((await ui.find({ key: 'top-later-y' }))?.props.hotkey).toBe('j')
+
+  await ui.press({ key: 'top-later-x' })
+  const [first, second] = await ui.findAll({ type: 'Code' })
+  expect(String(first?.props.source)).not.toContain('x line 1\n')
+  expect(String(second?.props.source)).toContain('y line 1\n')
+  await ui.unmount()
+})
+
+test('one more than fit closes the entry opened first', async ($, on) => {
+  mock.clock(on, { now: 1000 })
+  on('tool.call', () => ({ result: undefined as never, text: 'ok' }))
+
+  for (let call = 0; call < 9; call++) {
+    await $.tool.call({ tool: 'Bash', tool_use_id: `c${call}`, command: `echo ${call}` })
+  }
+
+  const ui = await $.ui.mount({ ...pane(60), surface: 'terminal' })
+  for (let call = 0; call < 9; call++) await ui.press({ key: `entry-c${call}` })
+
+  expect(await ui.findAll({ type: 'Code' })).toHaveLength(8)
+  expect(await ui.find({ key: 'close-c0' })).toBeUndefined()
+  expect(await ui.find({ key: 'close-c8' })).toBeDefined()
   await ui.unmount()
 })
 

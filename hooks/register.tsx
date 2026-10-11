@@ -13,6 +13,8 @@ const TITLE = "What's in context"
 // How much one drawing shows; nothing recorded is ever dropped.
 const ROWS = 200
 const PART = 8000
+// How many entries stay open at once: one more closes the one opened first.
+const OPEN = 8
 const BLOCKS = '▁▂▃▄▅▆▇█'
 
 const entries = atom({ plugin: 'whats-in-context', key: 'entries' } as const, [])
@@ -21,8 +23,7 @@ const breakdown = atom({ plugin: 'whats-in-context', key: 'breakdown' } as const
 const tab = atom({ plugin: 'whats-in-context', key: 'tab' } as const, 'timeline')
 const startedAt = atom({ plugin: 'whats-in-context', key: 'startedAt' } as const, 0)
 const isSeeded = atom({ plugin: 'whats-in-context', key: 'isSeeded' } as const, false)
-const selected = atom({ plugin: 'whats-in-context', key: 'selected' } as const, '')
-const page = atom({ plugin: 'whats-in-context', key: 'page' } as const, 0)
+const opened = atom({ plugin: 'whats-in-context', key: 'opened' } as const, [])
 const listEnd = atom({ plugin: 'whats-in-context', key: 'listEnd' } as const, -1)
 const bodies = { plugin: 'whats-in-context', key: 'bodies' } as const
 
@@ -148,6 +149,22 @@ const newlines = (text: string, until: number) => {
 
   return lines
 }
+
+// An opened entry's content as one text, and the part of it that is drawn.
+const viewOf = (entry: Entry, held: Body | undefined, page: number) => {
+  const isFile = entry.kind === 'file' || entry.kind === 'mention' || entry.kind === 'memory'
+  const whole =
+    held === undefined
+      ? ''
+      : isFile || held.input === ''
+        ? held.text
+        : `── Input ──\n${held.input}\n\n── Result ──\n${held.text}`
+  const cuts = partsOf(whole)
+
+  return { entry, held, isFile, whole, cuts, at: Math.min(Math.max(0, page), cuts.length - 1) }
+}
+
+type View = ReturnType<typeof viewOf>
 
 // A tool call in a few words: the argument a person would name it by.
 
@@ -366,15 +383,22 @@ const recover = async ($: EngineInterface, entry: Entry): Promise<Body> => {
 
 // Presses
 
+const shut = ($: EngineInterface, id: string) =>
+  update($, opened, list => list.filter(one => one.id !== id))
+
+const turnTo = ($: EngineInterface, id: string, page: number) =>
+  update($, opened, list => list.map(one => (one.id === id ? { ...one, page } : one)))
+
 const open = async ($: EngineInterface, entry: Entry) => {
   try {
-    if ((await read($, selected)) === entry.id) {
-      await update($, selected, () => '')
+    if ((await read($, opened)).some(one => one.id === entry.id)) {
+      await shut($, entry.id)
 
       return
     }
-    await update($, page, () => 0)
-    await update($, selected, () => entry.id)
+    await update($, opened, list =>
+      [...list.filter(one => one.id !== entry.id), { id: entry.id, page: 0 }].slice(-OPEN),
+    )
     const ref = { ...bodies, id: entry.id }
     if ((await $.state.get(ref)).value !== undefined) return
     let found: Body
@@ -391,7 +415,7 @@ const open = async ($: EngineInterface, entry: Entry) => {
 
 const show = async ($: EngineInterface, id: Tab) => {
   try {
-    await update($, selected, () => '')
+    await update($, opened, () => [])
     await update($, tab, () => id)
   } catch {
     // The tab stays.
@@ -563,7 +587,7 @@ export const register: Register = on => {
   on('session.end', async ($, e, next) => {
     if (e.reason === 'clear') {
       try {
-        await update($, selected, () => '')
+        await update($, opened, () => [])
         await update($, listEnd, () => -1)
         await update($, entries, () => [])
         await update($, samples, () => [])
@@ -607,7 +631,7 @@ export const register: Register = on => {
     const parts = await read($, breakdown)
     const shown = await read($, tab)
     const began = await read($, startedAt)
-    const chosen = await read($, selected)
+    const chosen = await read($, opened)
     const until = await read($, listEnd)
 
     const columns = Math.max(24, e.props.bodyColumns)
@@ -642,51 +666,39 @@ export const register: Register = on => {
     const end = until < 0 || until > list.length ? list.length : until
     const start = Math.max(0, end - ROWS)
 
-    // The one entry opened in place, drawn under its row.
-    const viewed =
-      chosen === ''
-        ? undefined
-        : (list.find(entry => entry.id === chosen) ?? memory.find(entry => entry.id === chosen))
-    const held =
-      viewed === undefined ? undefined : (await $.state.get({ ...bodies, id: viewed.id })).value
-    const leaf = viewed === undefined ? 0 : await read($, page)
+    // The entries opened in place, each drawn under its row.
+    const drawn =
+      shown === 'timeline'
+        ? list.slice(start, end)
+        : shown === 'files'
+          ? [...memory, ...readFiles.map(seen => seen.latest)]
+          : shown === 'prompts'
+            ? prompts
+            : []
+    const views = new Map<string, View>()
+    for (const one of chosen) {
+      const entry = drawn.find(each => each.id === one.id)
+      if (entry === undefined) continue
+      const held = (await $.state.get({ ...bodies, id: entry.id })).value
+      views.set(entry.id, viewOf(entry, held, one.page))
+    }
+    // The keys that turn the parts go to the long entry opened last.
+    const keyed = [...views.values()].reverse().find(view => view.cuts.length > 1)?.entry.id
 
-    const close = (
-      <Button
-        key="close"
-        plain
-        onPress={() => {
-          void update($, selected, () => '')
-        }}
-      >
-        ▴ Close
-      </Button>
-    )
-
-    const opened = (() => {
-      if (viewed === undefined) return null
+    const detail = ({ entry, held, isFile, whole, cuts, at }: View) => {
       const meta = [
-        KINDS[viewed.kind].name,
-        elapsed(viewed.at, base),
-        viewed.tokens === 0 ? '' : `~${count(Math.abs(viewed.tokens))} tokens`,
+        KINDS[entry.kind].name,
+        elapsed(entry.at, base),
+        entry.tokens === 0 ? '' : `~${count(Math.abs(entry.tokens))} tokens`,
       ]
         .filter(part => part !== '')
         .join(' · ')
-      const heading = headingOf(viewed)
-      const isFile = viewed.kind === 'file' || viewed.kind === 'mention' || viewed.kind === 'memory'
-      const whole =
-        held === undefined
-          ? ''
-          : isFile || held.input === ''
-            ? held.text
-            : `── Input ──\n${held.input}\n\n── Result ──\n${held.text}`
-      const cuts = partsOf(whole)
-      const at = Math.min(Math.max(0, leaf), cuts.length - 1)
+      const heading = headingOf(entry)
       const from = cuts[at] ?? 0
       const source = whole.slice(from, cuts[at + 1] ?? whole.length)
       const code = {
         source,
-        ...(isFile ? { path: viewed.label } : {}),
+        ...(isFile ? { path: entry.label } : {}),
         ...(held !== undefined && held.startLine > 0
           ? { startLine: held.startLine + newlines(whole, from) }
           : {}),
@@ -695,11 +707,11 @@ export const register: Register = on => {
         <Box flexDirection="row" gap={2}>
           {at > 0 && (
             <Button
-              key={`${where}-earlier`}
+              key={`${where}-earlier-${entry.id}`}
               plain
               {...(keys.earlier === undefined ? {} : { hotkey: keys.earlier })}
               onPress={() => {
-                void update($, page, () => at - 1)
+                void turnTo($, entry.id, at - 1)
               }}
             >
               ‹ Earlier
@@ -710,11 +722,11 @@ export const register: Register = on => {
           </Text>
           {at < cuts.length - 1 && (
             <Button
-              key={`${where}-later`}
+              key={`${where}-later-${entry.id}`}
               plain
               {...(keys.later === undefined ? {} : { hotkey: keys.later })}
               onPress={() => {
-                void update($, page, () => at + 1)
+                void turnTo($, entry.id, at + 1)
               }}
             >
               Later ›
@@ -735,20 +747,29 @@ export const register: Register = on => {
               {held.note}
             </Text>
           )}
-          {cuts.length > 1 && turn('top', { earlier: 'k', later: 'j' })}
+          {cuts.length > 1 &&
+            turn('top', entry.id === keyed ? { earlier: 'k', later: 'j' } : {})}
           {held !== undefined && source === '' && held.note === '' && (
             <Text dimColor>It put no text into the context.</Text>
           )}
           {source !== '' && <Code {...code} />}
           {cuts.length > 1 && turn('end', {})}
-          {close}
+          <Button
+            key={`close-${entry.id}`}
+            plain
+            onPress={() => {
+              void shut($, entry.id)
+            }}
+          >
+            ▴ Close
+          </Button>
         </Box>
       )
-    })()
+    }
 
     const row = (entry: Entry, when: string | undefined, width: number, right: string) => {
       const title = titleOf(entry, width)
-      const isOpen = entry.id === chosen
+      const view = views.get(entry.id)
 
       return (
         <Box flexDirection="column">
@@ -759,7 +780,9 @@ export const register: Register = on => {
               </Box>
             )}
             <Box width={2} flexShrink={0}>
-              <Text color={KINDS[entry.kind].color}>{isOpen ? '▾' : KINDS[entry.kind].glyph}</Text>
+              <Text color={KINDS[entry.kind].color}>
+                {view === undefined ? KINDS[entry.kind].glyph : '▾'}
+              </Text>
             </Box>
             <Box flexGrow={1} flexShrink={1}>
               <Button
@@ -777,7 +800,7 @@ export const register: Register = on => {
               <Text color={entry.tokens < 0 ? 'warning' : 'inactive'}>{right}</Text>
             </Box>
           </Box>
-          {isOpen && opened}
+          {view !== undefined && detail(view)}
         </Box>
       )
     }
@@ -841,7 +864,7 @@ export const register: Register = on => {
             </Text>
           </Box>
         )}
-        <Box flexDirection="row" gap={2} marginTop={1} marginBottom={1}>
+        <Box flexDirection="row" gap={2} marginTop={1}>
           {TABS.map((one, index) => (
             <Button
               key={`tab-${one.id}`}
@@ -855,6 +878,19 @@ export const register: Register = on => {
               {one.title}
             </Button>
           ))}
+        </Box>
+        <Box height={1}>
+          {chosen.length > 1 && (
+            <Button
+              key="close-all"
+              plain
+              onPress={() => {
+                void update($, opened, () => [])
+              }}
+            >
+              ▴ Close all
+            </Button>
+          )}
         </Box>
 
         {shown === 'timeline' && (
@@ -874,8 +910,8 @@ export const register: Register = on => {
             {list.length > ROWS && move('end', {})}
             {list.length > 0 && (
               <Text dimColor wrap="wrap">
-                Click a row to read what it put into the context. Sizes are estimates (characters /
-                4).
+                Click a row to read what it put into the context; up to {OPEN} stay open at once.
+                Sizes are estimates (characters / 4).
               </Text>
             )}
           </Box>
