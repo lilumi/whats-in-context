@@ -29,6 +29,21 @@ export type Body = {
 /** One entry opened in place, and which part of its content is drawn, from 0. */
 export type Opened = { id: string; page: number }
 
+/**
+ * The entries that hold a text, by their id. An entry's value is the line of its
+ * content the text is on, kept short around it; '' when its title holds the text.
+ */
+export type Hits = Record<string, string>
+
+/**
+ * A search of the entries: the text sought, the entries found to hold it, and the
+ * ids of those searched by their title alone, their content being out of reach.
+ */
+export type Search = { text: string; hits: Hits; unread: string[] }
+
+/** What held a search's text after it was run: the entries recorded and the files loaded since. */
+export type Joined = { text: string; hits: Hits }
+
 /** The context window's fill as one API response reported it. */
 export type Sample = { at: number; tokens: number; window: number }
 
@@ -61,6 +76,13 @@ declare module 'claude-code' {
       opened: Opened[]
       /** The entry count the timeline's window ends at; -1 follows the newest. */
       listEnd: number
+      /** The search that is set; null while none is. */
+      search: Search | null
+      /**
+       * What has joined that search since, under the same text. Kept apart from it, so
+       * that one more match does not rewrite every match there is; null while none is set.
+       */
+      joined: Joined | null
       /** Each entry's content, by the entry's id. */
       bodies: StateFamily<Body>
     }

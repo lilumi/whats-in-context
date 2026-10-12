@@ -3,9 +3,20 @@ import type {
   EngineInterface,
   Register,
   SessionContextUsage,
+  ToolUseSummary,
 } from 'claude-code'
 
-import type { Body, Breakdown, Entry, EntryKind, Sample, Tab } from '../types'
+import type {
+  Body,
+  Breakdown,
+  Entry,
+  EntryKind,
+  Hits,
+  Joined,
+  Sample,
+  Search,
+  Tab,
+} from '../types'
 
 const NAME = 'whats-in-context'
 const PANE = 'whats-in-context'
@@ -13,6 +24,11 @@ const TITLE = "What's in context"
 // How much one drawing shows; nothing recorded is ever dropped.
 const ROWS = 200
 const PART = 8000
+// A match may have a line under it saying where the text is, so a search draws half
+// the rows, and a list of more than that many goes without the lines.
+const MATCHES = 100
+// How much is kept, and drawn, of the line a match is on.
+const LINE = 100
 // How many entries stay open at once: one more closes the one opened first.
 const OPEN = 8
 const BLOCKS = '▁▂▃▄▅▆▇█'
@@ -25,6 +41,8 @@ const startedAt = atom({ plugin: 'whats-in-context', key: 'startedAt' } as const
 const isSeeded = atom({ plugin: 'whats-in-context', key: 'isSeeded' } as const, false)
 const opened = atom({ plugin: 'whats-in-context', key: 'opened' } as const, [])
 const listEnd = atom({ plugin: 'whats-in-context', key: 'listEnd' } as const, -1)
+const search = atom({ plugin: 'whats-in-context', key: 'search' } as const, null)
+const joined = atom({ plugin: 'whats-in-context', key: 'joined' } as const, null)
 const bodies = { plugin: 'whats-in-context', key: 'bodies' } as const
 
 const TABS: { id: Tab; title: string }[] = [
@@ -91,6 +109,17 @@ const hash = (text: string) => {
 
 const memoryId = (path: string) => `memory-${hash(path)}`
 
+// The instruction and memory files of a breakdown, as entries: they are loaded, not recorded.
+const memoryOf = (parts: Breakdown | null): Entry[] =>
+  (parts?.memoryFiles ?? []).map(file => ({
+    id: memoryId(file.path),
+    at: 0,
+    kind: 'memory',
+    label: file.path,
+    detail: file.type,
+    tokens: file.tokens,
+  }))
+
 const elapsed = (at: number, base: number) => {
   if (at === 0) return 'earlier'
   const seconds = Math.max(0, Math.floor((at - base) / 1000))
@@ -150,18 +179,24 @@ const newlines = (text: string, until: number) => {
   return lines
 }
 
+const isFile = (entry: Entry) =>
+  entry.kind === 'file' || entry.kind === 'mention' || entry.kind === 'memory'
+
+// A tool call is drawn as its input above its result, a file as its content alone.
+const INPUT = '── Input ──\n'
+const RESULT = '\n\n── Result ──\n'
+
+const hasInput = (entry: Entry, held: Body) => !isFile(entry) && held.input !== ''
+
+const wholeOf = (entry: Entry, held: Body) =>
+  hasInput(entry, held) ? `${INPUT}${held.input}${RESULT}${held.text}` : held.text
+
 // An opened entry's content as one text, and the part of it that is drawn.
 const viewOf = (entry: Entry, held: Body | undefined, page: number) => {
-  const isFile = entry.kind === 'file' || entry.kind === 'mention' || entry.kind === 'memory'
-  const whole =
-    held === undefined
-      ? ''
-      : isFile || held.input === ''
-        ? held.text
-        : `── Input ──\n${held.input}\n\n── Result ──\n${held.text}`
+  const whole = held === undefined ? '' : wholeOf(entry, held)
   const cuts = partsOf(whole)
 
-  return { entry, held, isFile, whole, cuts, at: Math.min(Math.max(0, page), cuts.length - 1) }
+  return { entry, held, whole, cuts, at: Math.min(Math.max(0, page), cuts.length - 1) }
 }
 
 type View = ReturnType<typeof viewOf>
@@ -267,15 +302,22 @@ const fit = (name: string, rest: string, room: number) => {
   return { head, tail: tail === '' || left < 4 ? '' : ` ${cut(tail, left)}` }
 }
 
-const titleOf = (entry: Entry, room: number) => {
-  if (entry.kind === 'file' || entry.kind === 'mention' || entry.kind === 'memory') {
+// The two parts of a row's title, whole: what names the entry, then the rest of it.
+const titled = (entry: Entry) => {
+  if (isFile(entry)) {
     const rest = [dirName(entry.label), entry.detail].filter(part => part !== '').join(' · ')
 
-    return fit(baseName(entry.label), rest, room)
+    return { name: baseName(entry.label), rest }
   }
-  if (entry.kind === 'tool') return fit(toolName(entry.label), entry.detail, room)
+  if (entry.kind === 'tool') return { name: toolName(entry.label), rest: entry.detail }
 
-  return fit(entry.label, entry.detail, room)
+  return { name: entry.label, rest: entry.detail }
+}
+
+const titleOf = (entry: Entry, room: number) => {
+  const { name, rest } = titled(entry)
+
+  return fit(name, rest, room)
 }
 
 const headingOf = (entry: Entry) => {
@@ -286,15 +328,150 @@ const headingOf = (entry: Entry) => {
   return oneLine(entry.detail === '' ? entry.label : `${entry.label} (${entry.detail})`)
 }
 
+// A search: the text is sought as it was typed, in any letter case, never as a pattern.
+// A space in it stands for any run of white space within a line (spaces, tabs, a
+// no-break space), since what is drawn shows each of those as one space.
+
+const soughtOf = (text: string) => oneLine(text)
+
+const needleOf = (sought: string) =>
+  new RegExp(sought.replace(/[\\^$.*+?()[\]{}|]/g, '\\$&').replace(/ /g, '[^\\S\\n]+'), 'iu')
+
+// What names an entry, whole, where a row draws it cut: its title as all the room
+// would draw it, which has its detail in it; its label; and a path's label spelled
+// with the slash it is drawn with.
+const namesOf = (entry: Entry) => {
+  const { name, rest } = titled(entry)
+
+  return [
+    oneLine(`${name} ${rest}`),
+    entry.label,
+    ...(isFile(entry) ? [entry.label.replace(/\\/g, '/')] : []),
+  ]
+}
+
+const isNamed = (entry: Entry, needle: RegExp) => namesOf(entry).some(name => needle.test(name))
+
+// A text cut to the room it has around one part of it: what leads up to the part,
+// the part, and what follows it.
+const around = (text: string, at: number, size: number, room: number) => {
+  const end = at + size
+  if (text.length <= room) {
+    return { before: text.slice(0, at), hit: text.slice(at, end), after: text.slice(end) }
+  }
+  const lead = Math.min(at, Math.max(0, Math.floor((room - size) / 3)))
+  const before = lead < at ? `…${text.slice(at - lead + 1, at)}` : text.slice(0, at)
+  const hit = cut(text.slice(at, end), Math.max(2, room - before.length))
+  const left = room - before.length - hit.length
+
+  return { before, hit, after: left < 2 ? '' : cut(text.slice(end), left) }
+}
+
+type Mark = ReturnType<typeof around>
+
+// The part of a text that holds what is sought, set apart; undefined when none does.
+const markOf = (text: string, needle: RegExp, room: number) => {
+  const found = needle.exec(text)
+
+  return found === null ? undefined : around(text, found.index, found[0].length, room)
+}
+
+// Where an entry's content first holds what is sought: how far into the text drawn
+// for it, and the line it is on, kept short around it.
+const spotOf = (entry: Entry, held: Body, needle: RegExp) => {
+  const sides = hasInput(entry, held)
+    ? [
+        { text: held.input, base: INPUT.length },
+        { text: held.text, base: INPUT.length + held.input.length + RESULT.length },
+      ]
+    : [{ text: held.text, base: 0 }]
+  for (const { text, base } of sides) {
+    const found = needle.exec(text)
+    if (found === null) continue
+    const end = found.index + found[0].length
+    const from = Math.max(text.lastIndexOf('\n', found.index - 1) + 1, found.index - LINE)
+    const edge = text.indexOf('\n', end)
+    const line = text.slice(from, Math.min(edge === -1 ? text.length : edge, end + LINE))
+    const indent = line.length - line.trimStart().length
+    const mark = around(
+      line.replace(/\t/g, ' ').trim(),
+      found.index - from - indent,
+      found[0].length,
+      LINE,
+    )
+
+    return { at: base + found.index, line: `${mark.before}${mark.hit}${mark.after}` }
+  }
+
+  return undefined
+}
+
+// How an entry holds what is sought: '' in its title, else the line of its content
+// it is on; undefined when it does not.
+const hitOf = (entry: Entry, held: Body | undefined, needle: RegExp) =>
+  isNamed(entry, needle) ? '' : held === undefined ? undefined : spotOf(entry, held, needle)?.line
+
+// What a search found for one entry, undefined when it holds nothing of it. An id is
+// looked up as the search's own, never as a name every object has.
+const foundIn = (hits: Hits, id: string) => (Object.hasOwn(hits, id) ? hits[id] : undefined)
+
+// The same over a search and what has joined it since.
+const foundBy = (asked: Search, late: Joined | null, id: string) =>
+  foundIn(asked.hits, id) ?? (late?.text === asked.text ? foundIn(late.hits, id) : undefined)
+
+// The part of an entry's content that first holds what is sought; the first when none does.
+const pageOf = (entry: Entry, held: Body, needle: RegExp | undefined) => {
+  const spot = needle === undefined ? undefined : spotOf(entry, held, needle)
+  if (spot === undefined) return 0
+
+  return partsOf(wholeOf(entry, held)).filter(from => from <= spot.at).length - 1
+}
+
+type Why = { head?: Mark; tail?: Mark; under?: Mark }
+
+// Where a row shows what is sought: in its title as it is drawn, else on a line under
+// it, which is the line of its content, or the name its title was cut from.
+const whyOf = (
+  entry: Entry,
+  title: { head: string; tail: string },
+  line: string | undefined,
+  needle: RegExp,
+  room: number,
+): Why => {
+  const head = markOf(title.head, needle, title.head.length)
+  if (head !== undefined) return { head }
+  const tail = markOf(title.tail, needle, title.tail.length)
+  if (tail !== undefined) return { tail }
+  const said = line === undefined || line === '' ? [] : [line]
+  for (const text of [...said, ...namesOf(entry).map(oneLine)]) {
+    const under = markOf(text, needle, room)
+    if (under !== undefined) return { under }
+  }
+
+  return said[0] === undefined ? {} : { under: { before: cut(said[0], room), hit: '', after: '' } }
+}
+
 // State writes. A failed write never costs the event it observes.
+
+// Entries that hold what is sought join the search, while it is still the one set.
+// They are kept beside it: one more match then rewrites those few, not every match.
+const join = ($: EngineInterface, sought: string, hits: Hits) =>
+  update($, joined, late =>
+    late !== null && late.text === sought
+      ? { text: sought, hits: { ...late.hits, ...hits } }
+      : late,
+  )
 
 const add = async ($: EngineInterface, make: (at: number) => Entry, body?: Body) => {
   try {
     const entry = make(await $.clock.now())
     if (body !== undefined) await $.state.set({ ...bodies, id: entry.id }, body)
     await update($, entries, list => [...list, entry])
+    const asked = await read($, search)
+    const hit = asked === null ? undefined : hitOf(entry, body, needleOf(asked.text))
+    if (asked !== null && hit !== undefined) await join($, asked.text, { [entry.id]: hit })
   } catch {
-    // The entry is left out.
+    // The entry is left out: of the list, or of the search that is set.
   }
 }
 
@@ -313,7 +490,14 @@ const keep = async ($: EngineInterface, context: SessionContextUsage) => {
       tokens: file.tokens,
     })),
   }
+  const known = new Set(memoryOf(await read($, breakdown)).map(entry => entry.id))
   await update($, breakdown, () => next)
+  // An instruction file loaded since joins the search that is set.
+  const asked = await read($, search)
+  const fresh = memoryOf(next).filter(entry => !known.has(entry.id))
+  if (asked !== null && fresh.length > 0) {
+    await join($, asked.text, (await sift($, fresh, needleOf(asked.text))).hits)
+  }
 }
 
 const refresh = async ($: EngineInterface) => {
@@ -359,26 +543,73 @@ const seed = async ($: EngineInterface) => {
   }
 }
 
-// An entry's content when none was kept as it was recorded.
-const recover = async ($: EngineInterface, entry: Entry): Promise<Body> => {
+// The tool calls the transcript holds, by their id.
+const usesOf = async ($: EngineInterface) => {
+  const uses = new Map<string, ToolUseSummary>()
+  for (const row of await $.session.messages()) {
+    for (const use of row.toolUses) uses.set(use.tool_use_id, use)
+  }
+
+  return uses
+}
+
+// An entry's content when none was kept as it was recorded. A search of many
+// entries hands in the transcript's calls, read once for them all.
+const recover = async (
+  $: EngineInterface,
+  entry: Entry,
+  past?: Map<string, ToolUseSummary>,
+): Promise<Body> => {
   if (entry.kind === 'memory' || entry.kind === 'mention') {
     const text = clean(await $.fs.read(entry.label))
 
     return { ...NONE, text, startLine: 1, note: 'The file as it is on disk now.' }
   }
   if (entry.kind === 'tool' || entry.kind === 'file') {
-    for (const row of await $.session.messages()) {
-      for (const use of row.toolUses) {
-        if (use.tool_use_id !== entry.id) continue
-
-        return bodyOf(use.tool, use.input, use.text ?? '', use.result)
-      }
-    }
+    const use = (past ?? (await usesOf($))).get(entry.id)
+    if (use !== undefined) return bodyOf(use.tool, use.input, use.text ?? '', use.result)
 
     return { ...NONE, note: 'This call is no longer in the transcript, so its content is gone.' }
   }
 
   return { ...NONE, text: clean(entry.label), note: 'Only this much of it was kept.' }
+}
+
+// Which of some entries hold what is sought, and how; and which could be searched by
+// their title alone. Content that was not kept is read back for the search, the
+// transcript once for every call and an instruction file from disk, and not kept by it.
+const sift = async ($: EngineInterface, list: Entry[], needle: RegExp) => {
+  const hits: Hits = {}
+  const unread: string[] = []
+  let past: Map<string, ToolUseSummary> | undefined
+  // An entry's content when none was kept; undefined when it is out of reach.
+  const back = async (entry: Entry) => {
+    try {
+      if (entry.kind === 'tool' || entry.kind === 'file') {
+        past ??= await usesOf($).catch(() => new Map<string, ToolUseSummary>())
+        if (!past.has(entry.id)) return undefined
+      }
+
+      return await recover($, entry, past)
+    } catch {
+      return undefined
+    }
+  }
+  for (const entry of list) {
+    if (isNamed(entry, needle)) {
+      hits[entry.id] = ''
+      continue
+    }
+    const held = (await $.state.get({ ...bodies, id: entry.id })).value ?? (await back(entry))
+    if (held === undefined) {
+      unread.push(entry.id)
+      continue
+    }
+    const line = spotOf(entry, held, needle)?.line
+    if (line !== undefined) hits[entry.id] = line
+  }
+
+  return { hits, unread }
 }
 
 // Presses
@@ -389,6 +620,7 @@ const shut = ($: EngineInterface, id: string) =>
 const turnTo = ($: EngineInterface, id: string, page: number) =>
   update($, opened, list => list.map(one => (one.id === id ? { ...one, page } : one)))
 
+// Under a search a row opens at the part of its content that holds what is sought.
 const open = async ($: EngineInterface, entry: Entry) => {
   try {
     if ((await read($, opened)).some(one => one.id === entry.id)) {
@@ -396,11 +628,15 @@ const open = async ($: EngineInterface, entry: Entry) => {
 
       return
     }
-    await update($, opened, list =>
-      [...list.filter(one => one.id !== entry.id), { id: entry.id, page: 0 }].slice(-OPEN),
-    )
+    const asked = await read($, search)
+    const needle = asked === null ? undefined : needleOf(asked.text)
     const ref = { ...bodies, id: entry.id }
-    if ((await $.state.get(ref)).value !== undefined) return
+    const kept = (await $.state.get(ref)).value
+    const page = kept === undefined ? 0 : pageOf(entry, kept, needle)
+    await update($, opened, list =>
+      [...list.filter(one => one.id !== entry.id), { id: entry.id, page }].slice(-OPEN),
+    )
+    if (kept !== undefined) return
     let found: Body
     try {
       found = await recover($, entry)
@@ -408,8 +644,66 @@ const open = async ($: EngineInterface, entry: Entry) => {
       found = { ...NONE, note: 'Its content could not be loaded.' }
     }
     await $.state.set(ref, found)
+    const later = pageOf(entry, found, needle)
+    if (later > 0) await turnTo($, entry.id, later)
   } catch {
     // The row stays closed.
+  }
+}
+
+// The search asked for last is the one that stands: an older one that ends later is dropped.
+let seeks = 0
+
+// An empty text takes the search away. The open entries a search hides are closed;
+// taking it away leaves the open ones open. Asked for on the Now tab, which lists
+// no entry, a search is shown on the timeline.
+const seek = async ($: EngineInterface, text: string) => {
+  seeks += 1
+  const mine = seeks
+  try {
+    const sought = soughtOf(text)
+    if (sought === '') {
+      await update($, search, () => null)
+      await update($, joined, () => null)
+      await update($, listEnd, () => -1)
+
+      return
+    }
+    const needle = needleOf(sought)
+    const recorded = await read($, entries)
+    const loaded = memoryOf(await read($, breakdown))
+    const first = await sift($, recorded, needle)
+    const second = await sift($, loaded, needle)
+    const hits = { ...first.hits, ...second.hits }
+    const unread = [...first.unread, ...second.unread]
+    // Each write is told at the write itself whether this search still stands: a
+    // newer one, or a /clear, may have come while it read.
+    await update($, search, held => (mine === seeks ? { text: sought, hits, unread } : held))
+    await update($, joined, held => (mine === seeks ? { text: sought, hits: {} } : held))
+    await update($, listEnd, held => (mine === seeks ? -1 : held))
+    await update($, opened, list =>
+      mine === seeks ? list.filter(one => foundIn(hits, one.id) !== undefined) : list,
+    )
+    if (mine !== seeks) return
+    if ((await read($, tab)) === 'now') await update($, tab, () => 'timeline')
+    // What was recorded, and what was loaded, while the others were read.
+    const late = [
+      ...(await read($, entries)).slice(recorded.length),
+      ...memoryOf(await read($, breakdown)).filter(
+        entry => !loaded.some(one => one.id === entry.id),
+      ),
+    ]
+    if (late.length > 0) await join($, sought, (await sift($, late, needle)).hits)
+  } catch {
+    // The lists stay as they were.
+  }
+}
+
+const reach = async ($: EngineInterface) => {
+  try {
+    await $.ui.focus({ requestId: PANE, key: 'search' })
+  } catch {
+    // The focus stays where it was.
   }
 }
 
@@ -444,6 +738,7 @@ export const register: Register = on => {
     await $.command.register({
       name: NAME,
       description: 'Show what Claude has read into context this session',
+      argumentHint: '[text to search for]',
     })
     void $.ui.open({ id: PANE, title: TITLE })
     if (!(await read($, isSeeded))) {
@@ -455,12 +750,15 @@ export const register: Register = on => {
     return next(e)
   })
 
-  on('command.run', { command: NAME }, async $ => {
+  // A text after the command is searched for.
+  on('command.run', { command: NAME }, async ($, e) => {
     const opened = await $.ui.open({ id: PANE, title: TITLE, focus: true })
+    const sought = soughtOf(e.args)
+    if (sought !== '') await seek($, sought)
 
     return {
       text: opened.isPlaced
-        ? `${TITLE}: pane opened.`
+        ? `${TITLE}: pane opened${sought === '' ? '' : `, searching for "${cut(sought, 60)}"`}.`
         : `${TITLE}: the pane is not drawn here (${opened.reason}).`,
     }
   })
@@ -589,6 +887,9 @@ export const register: Register = on => {
   on('session.end', async ($, e, next) => {
     if (e.reason === 'clear') {
       try {
+        seeks += 1
+        await update($, search, () => null)
+        await update($, joined, () => null)
         await update($, opened, () => [])
         await update($, listEnd, () => -1)
         await update($, entries, () => [])
@@ -622,34 +923,37 @@ export const register: Register = on => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text, Button, Code } = $.ui.resolve(e)
-    const list = await read($, entries)
+    // The mobile app draws no field: a search is set there by the command alone.
+    const Input = e.surface === 'mobile' ? undefined : $.ui.resolve(e).Input
+    const every = await read($, entries)
     const fills = await read($, samples)
     const parts = await read($, breakdown)
     const shown = await read($, tab)
     const began = await read($, startedAt)
     const chosen = await read($, opened)
     const until = await read($, listEnd)
+    const asked = await read($, search)
+    const late = await read($, joined)
 
     const columns = Math.max(24, e.props.bodyColumns)
-    const base = began || (list.find(entry => entry.at > 0)?.at ?? 0)
+    const base = began || (every.find(entry => entry.at > 0)?.at ?? 0)
     const { used, window, percent } = fillOf(fills, parts)
     const peak = fills.reduce((most, sample) => Math.max(most, sample.tokens), 0)
-    const largest = list.reduce((most, entry) => Math.max(most, Math.abs(entry.tokens)), 1)
+    const largest = every.reduce((most, entry) => Math.max(most, Math.abs(entry.tokens)), 1)
     const hasBar = columns >= 64
     const room = Math.max(8, columns - 19 - (hasBar ? 7 : 0))
 
-    const memory: Entry[] = (parts?.memoryFiles ?? []).map(file => ({
-      id: memoryId(file.path),
-      at: 0,
-      kind: 'memory',
-      label: file.path,
-      detail: file.type,
-      tokens: file.tokens,
-    }))
-    const prompts = list.filter(entry => entry.kind === 'prompt')
+    // A search leaves each list the entries that hold what is sought. A file read
+    // several times is then counted, and opened, by the reads that hold it.
+    const needle = asked === null ? undefined : needleOf(asked.text)
+    const isHit = (entry: Entry) =>
+      asked === null || foundBy(asked, late, entry.id) !== undefined
+    const list = every.filter(isHit)
+    const memory = memoryOf(parts)
+    const prompts = every.filter(entry => entry.kind === 'prompt')
+    const reads = every.filter(entry => entry.kind === 'file' || entry.kind === 'mention')
     const files = new Map<string, { reads: number; tokens: number; latest: Entry }>()
-    for (const entry of list) {
-      if (entry.kind !== 'file' && entry.kind !== 'mention') continue
+    for (const entry of reads.filter(isHit)) {
       const seen = files.get(entry.label)
       files.set(entry.label, {
         reads: (seen?.reads ?? 0) + 1,
@@ -658,18 +962,36 @@ export const register: Register = on => {
       })
     }
     const readFiles = [...files.values()].sort((a, b) => b.tokens - a.tokens)
+    const shownMemory = memory.filter(isHit)
+    const shownPrompts = prompts.filter(isHit)
+    // What the line under the field counts, of the rows the tab shown lists: the
+    // matches, the rows there are, and those searched by their title alone.
+    const unread = new Set(asked?.unread ?? [])
+    const isUnread = (entry: Entry) => unread.has(entry.id)
+    const pathsOf = (some: Entry[]) => new Set(some.map(entry => entry.label)).size
+    const [matching, among, titleOnly] =
+      shown === 'files'
+        ? [
+            shownMemory.length + readFiles.length,
+            memory.length + pathsOf(reads),
+            memory.filter(isUnread).length + pathsOf(reads.filter(isUnread)),
+          ]
+        : shown === 'prompts'
+          ? [shownPrompts.length, prompts.length, prompts.filter(isUnread).length]
+          : [list.length, every.length, every.filter(isUnread).length]
 
+    const span = asked === null ? ROWS : MATCHES
     const end = until < 0 || until > list.length ? list.length : until
-    const start = Math.max(0, end - ROWS)
+    const start = Math.max(0, end - span)
 
     // The entries opened in place, each drawn under its row.
     const drawn =
       shown === 'timeline'
         ? list.slice(start, end)
         : shown === 'files'
-          ? [...memory, ...readFiles.map(seen => seen.latest)]
+          ? [...shownMemory, ...readFiles.map(seen => seen.latest)]
           : shown === 'prompts'
-            ? prompts
+            ? shownPrompts
             : []
     const views = new Map<string, View>()
     for (const one of chosen) {
@@ -681,7 +1003,7 @@ export const register: Register = on => {
     // The keys that turn the parts go to the long entry opened last.
     const keyed = [...views.values()].reverse().find(view => view.cuts.length > 1)?.entry.id
 
-    const detail = ({ entry, held, isFile, whole, cuts, at }: View) => {
+    const detail = ({ entry, held, whole, cuts, at }: View) => {
       const meta = [
         KINDS[entry.kind].name,
         elapsed(entry.at, base),
@@ -694,7 +1016,7 @@ export const register: Register = on => {
       const source = whole.slice(from, cuts[at + 1] ?? whole.length)
       const code = {
         source,
-        ...(isFile ? { path: entry.label } : {}),
+        ...(isFile(entry) ? { path: entry.label } : {}),
         ...(held !== undefined && held.startLine > 0
           ? { startLine: held.startLine + newlines(whole, from) }
           : {}),
@@ -763,9 +1085,32 @@ export const register: Register = on => {
       )
     }
 
-    const row = (entry: Entry, when: string | undefined, width: number, right: string) => {
-      const title = titleOf(entry, width)
+    // A text with the part that holds what is sought set apart from the rest of it.
+    const lit = (mark: Mark, isDim: boolean) => [
+      isDim ? <Text dimColor>{mark.before}</Text> : mark.before,
+      <Text inverse>{mark.hit}</Text>,
+      isDim ? <Text dimColor>{mark.after}</Text> : mark.after,
+    ]
+
+    // Under a search a row says where it holds what is sought: in its title, or on a
+    // line under it. A drawing has room for those lines under as many rows as the
+    // timeline draws matches: a longer list of files or prompts is drawn without
+    // them, and is then no longer than it is with no search.
+    const hasLines = drawn.length <= MATCHES
+    const row = (
+      entry: Entry,
+      when: string | undefined,
+      width: number,
+      right: string,
+      hasDetail = true,
+    ) => {
+      const title = titleOf(hasDetail ? entry : { ...entry, detail: '' }, width)
       const view = views.get(entry.id)
+      const why: Why =
+        needle === undefined || asked === null
+          ? {}
+          : whyOf(entry, title, foundBy(asked, late, entry.id), needle, Math.min(width, LINE))
+      const under = hasLines ? why.under : undefined
 
       return (
         <Box flexDirection="column">
@@ -788,14 +1133,19 @@ export const register: Register = on => {
                   void open($, entry)
                 }}
               >
-                {title.head}
-                <Text dimColor>{title.tail}</Text>
+                {why.head === undefined ? title.head : lit(why.head, false)}
+                {why.tail === undefined ? <Text dimColor>{title.tail}</Text> : lit(why.tail, true)}
               </Button>
             </Box>
             <Box flexShrink={0} marginLeft={1}>
               <Text color={entry.tokens < 0 ? 'warning' : 'inactive'}>{right}</Text>
             </Box>
           </Box>
+          {under !== undefined && (
+            <Box marginLeft={when === undefined ? 2 : 10}>
+              <Text wrap="truncate-end">{lit(under, true)}</Text>
+            </Box>
+          )}
           {view !== undefined && detail(view)}
         </Box>
       )
@@ -809,7 +1159,7 @@ export const register: Register = on => {
             plain
             {...(keys.older === undefined ? {} : { hotkey: keys.older })}
             onPress={() => {
-              void update($, listEnd, () => Math.max(ROWS, end - ROWS))
+              void update($, listEnd, () => Math.max(span, end - span))
             }}
           >
             ‹ Older
@@ -824,7 +1174,7 @@ export const register: Register = on => {
             plain
             {...(keys.newer === undefined ? {} : { hotkey: keys.newer })}
             onPress={() => {
-              void update($, listEnd, () => (end + ROWS >= list.length ? -1 : end + ROWS))
+              void update($, listEnd, () => (end + span >= list.length ? -1 : end + span))
             }}
           >
             Newer ›
@@ -875,6 +1225,47 @@ export const register: Register = on => {
             </Button>
           ))}
         </Box>
+        {shown !== 'now' && Input !== undefined && (
+          <Box flexDirection="row" gap={1}>
+            <Button
+              key="search-focus"
+              plain
+              hotkey="s"
+              onPress={() => {
+                void reach($)
+              }}
+            >
+              Search
+            </Button>
+            <Input
+              key="search"
+              placeholder="in titles and content"
+              value={asked?.text ?? ''}
+              submitLabel="search"
+              onSubmit={text => {
+                void seek($, text)
+              }}
+            />
+          </Box>
+        )}
+        {shown !== 'now' && asked !== null && (
+          <Box flexDirection="row" gap={2}>
+            <Text dimColor wrap="wrap">
+              {matching === 0 ? 'Nothing matches' : `${matching} of ${among} match`}
+              {Input === undefined ? ` "${cut(asked.text, 40)}"` : ''}
+              {titleOnly > 0 ? ` · ${titleOnly} by title only` : ''}
+            </Text>
+            <Button
+              key="search-clear"
+              plain
+              onPress={() => {
+                void seek($, '')
+              }}
+            >
+              ✕ Clear
+            </Button>
+          </Box>
+        )}
         <Box height={1}>
           {chosen.length > 1 && (
             <Button
@@ -891,8 +1282,8 @@ export const register: Register = on => {
 
         {shown === 'timeline' && (
           <Box flexDirection="column">
-            {list.length === 0 && <Text dimColor>Nothing has entered the context yet.</Text>}
-            {list.length > ROWS && move('top', { older: 'u', newer: 'd' })}
+            {every.length === 0 && <Text dimColor>Nothing has entered the context yet.</Text>}
+            {list.length > span && move('top', { older: 'u', newer: 'd' })}
             {list
               .slice(start, end)
               .map(entry =>
@@ -903,8 +1294,8 @@ export const register: Register = on => {
                   `${hasBar ? `${bar(Math.abs(entry.tokens), largest, 6)} ` : ''}${size(entry.tokens)}`,
                 ),
               )}
-            {list.length > ROWS && move('end', {})}
-            {list.length > 0 && (
+            {list.length > span && move('end', {})}
+            {every.length > 0 && (
               <Text dimColor wrap="wrap">
                 Click a row to read what it put into the context; up to {OPEN} stay open at once.
                 Sizes are estimates (characters / 4).
@@ -916,18 +1307,23 @@ export const register: Register = on => {
         {shown === 'files' && (
           <Box flexDirection="column">
             <Text bold>Instruction and memory files</Text>
-            {memory.length === 0 && <Text dimColor>None loaded.</Text>}
-            {memory.map(entry => row(entry, undefined, room + 8, count(entry.tokens)))}
+            {shownMemory.length === 0 && (
+              <Text dimColor>{memory.length === 0 ? 'None loaded.' : 'None matches.'}</Text>
+            )}
+            {shownMemory.map(entry => row(entry, undefined, room + 8, count(entry.tokens)))}
             <Box marginTop={1}>
               <Text bold>Read during the session</Text>
             </Box>
-            {readFiles.length === 0 && <Text dimColor>No file read yet.</Text>}
+            {readFiles.length === 0 && (
+              <Text dimColor>{reads.length === 0 ? 'No file read yet.' : 'None matches.'}</Text>
+            )}
             {readFiles.map(seen =>
               row(
-                { ...seen.latest, detail: '' },
+                seen.latest,
                 undefined,
                 room + 8,
                 `${seen.reads}×${seen.tokens === 0 ? '' : ` ~${count(seen.tokens)}`}`,
+                false,
               ),
             )}
           </Box>
@@ -936,15 +1332,19 @@ export const register: Register = on => {
         {shown === 'prompts' && (
           <Box flexDirection="column">
             {prompts.length === 0 && <Text dimColor>No prompt yet.</Text>}
-            {prompts.map((entry, index) => (
-              <Box flexDirection="column" marginBottom={1}>
-                <Text dimColor>
-                  #{index + 1} · {elapsed(entry.at, base)} · ~{count(entry.tokens)} tokens
-                  {entry.detail === '' ? '' : ` · ${oneLine(entry.detail)}`}
-                </Text>
-                {row({ ...entry, detail: '' }, undefined, room + 8, '')}
-              </Box>
-            ))}
+            {prompts.flatMap((entry, index) =>
+              isHit(entry)
+                ? [
+                    <Box flexDirection="column" marginBottom={1}>
+                      <Text dimColor>
+                        #{index + 1} · {elapsed(entry.at, base)} · ~{count(entry.tokens)} tokens
+                        {entry.detail === '' ? '' : ` · ${oneLine(entry.detail)}`}
+                      </Text>
+                      {row(entry, undefined, room + 8, '', false)}
+                    </Box>,
+                  ]
+                : [],
+            )}
           </Box>
         )}
 
